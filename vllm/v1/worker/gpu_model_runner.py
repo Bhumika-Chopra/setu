@@ -4469,6 +4469,31 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         stride=(hidden_size, 2 * hidden_size, *kv_cache.stride()[2:]),
                     )
 
+    def _try_connector_allocate_kv_caches(
+        self, kv_cache_config: KVCacheConfig
+    ) -> dict[str, torch.Tensor] | None:
+        """Ask the KV connector to allocate KV caches, if it supports it.
+
+        Returns the connector-allocated caches, or None to fall back to
+        the standard vLLM allocation path.
+        """
+        if not has_kv_transfer_group():
+            return None
+
+        kv_connector = get_kv_transfer_group()
+        allocate_fn = getattr(kv_connector, "allocate_kv_caches", None)
+        if allocate_fn is None:
+            return None
+
+        # Build a layer_name → attention backend mapping from attn_groups.
+        attn_backends: dict[str, type[AttentionBackend]] = {}
+        for groups in self.attn_groups:
+            for group in groups:
+                for layer_name in group.layer_names:
+                    attn_backends[layer_name] = group.backend
+
+        return allocate_fn(kv_cache_config, attn_backends, self.device)
+
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor]:
@@ -4481,12 +4506,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             Dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
-        # Initialize the memory buffer for KV cache
-        kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
-        # Change the memory buffer to the desired shape
-        kv_caches = self._reshape_kv_cache_tensors(
-            kv_cache_config, kv_cache_raw_tensors
-        )
+        # If a KV connector provides its own allocation (e.g. Setu),
+        # delegate to it so the memory is registered with the connector's
+        # runtime from the start.
+        kv_caches = self._try_connector_allocate_kv_caches(kv_cache_config)
+        if kv_caches is None:
+            # Standard path: allocate raw tensors and reshape them.
+            kv_cache_raw_tensors = self._allocate_kv_cache_tensors(
+                kv_cache_config)
+            kv_caches = self._reshape_kv_cache_tensors(
+                kv_cache_config, kv_cache_raw_tensors
+            )
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
